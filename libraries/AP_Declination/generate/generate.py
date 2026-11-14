@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 
 # flake8: noqa
-'''
-generate field tables from IGRF13. Note that this requires python3
-'''
+"""
+Generate field tables from IGRF-14 using ppigrf.
+Requires Python 3.
 
-import igrf
+The generated tables represent the geomagnetic field at the
+date specified in this script.
+
+# TODO: Consider time and altitude dependence of the magnetic field.
+# Current tables are generated for a fixed date (2026-01-01) and zero altitude (0 km).
+# Local crustal anomalies and external magnetic disturbances are not modeled.
+"""
+
+import ppigrf
 import numpy as np
 import datetime
 from pathlib import Path
@@ -13,10 +21,11 @@ from pymavlink.rotmat import Vector3, Matrix3
 import math
 
 import argparse
-parser = argparse.ArgumentParser(description='generate mag tables')
-parser.add_argument('--sampling-res', type=int, default=10, help='sampling resolution, degrees')
-parser.add_argument('--check-error', action='store_true', help='check max error')
-parser.add_argument('--filename', type=str, default='tables.cpp', help='tables file')
+
+parser = argparse.ArgumentParser(description="generate mag tables")
+parser.add_argument("--sampling-res", type=int, default=10, help="sampling resolution, degrees")
+parser.add_argument("--check-error", action="store_true", help="check max error")
+parser.add_argument("--filename", type=str, default="tables.cpp", help="tables file")
 
 args = parser.parse_args()
 
@@ -24,23 +33,24 @@ if not Path("AP_Declination.h").is_file():
     raise OSError("Please run this tool from the AP_Declination directory")
 
 
-def write_table(f,name, table):
-    '''write one table'''
-    f.write("__EXTFLASHFUNC__ const float AP_Declination::%s[%u][%u] = {\n" %
-                (name, NUM_LAT, NUM_LON))
+def write_table(f, name, table):
+    """write one table"""
+    f.write("__EXTFLASHFUNC__ const float AP_Declination::%s[%u][%u] = {\n" % (name, NUM_LAT, NUM_LON))
     for i in range(NUM_LAT):
         f.write("    {")
         for j in range(NUM_LON):
             f.write("%.5ff" % table[i][j])
-            if j != NUM_LON-1:
+            if j != NUM_LON - 1:
                 f.write(",")
         f.write("}")
-        if i != NUM_LAT-1:
+        if i != NUM_LAT - 1:
             f.write(",")
         f.write("\n")
     f.write("};\n\n")
 
-date = datetime.datetime.now()
+
+# Reference date used to generate the static geomagnetic tables
+date = datetime.datetime(2026, 1, 1)
 
 SAMPLING_RES = args.sampling_res
 SAMPLING_MIN_LAT = -90
@@ -48,8 +58,8 @@ SAMPLING_MAX_LAT = 90
 SAMPLING_MIN_LON = -180
 SAMPLING_MAX_LON = 180
 
-lats = np.arange(SAMPLING_MIN_LAT, SAMPLING_MAX_LAT+SAMPLING_RES, SAMPLING_RES)
-lons = np.arange(SAMPLING_MIN_LON, SAMPLING_MAX_LON+SAMPLING_RES, SAMPLING_RES)
+lats = np.arange(SAMPLING_MIN_LAT, SAMPLING_MAX_LAT + SAMPLING_RES, SAMPLING_RES)
+lons = np.arange(SAMPLING_MIN_LON, SAMPLING_MAX_LON + SAMPLING_RES, SAMPLING_RES)
 
 NUM_LAT = lats.size
 NUM_LON = lons.size
@@ -62,16 +72,28 @@ max_error = 0
 max_error_pos = None
 max_error_field = None
 
+
 def get_igrf(lat, lon):
-    '''return field as [declination_deg, inclination_deg, intensity_gauss]'''
-    mag = igrf.igrf(date, glat=lat, glon=lon, alt_km=0., isv=0, itype=1)
-    intensity = float(mag.total/1e5)
-    inclination = float(mag.incl)
-    declination = float(mag.decl)
+    """return field as [declination_deg, inclination_deg, intensity_gauss]"""
+
+    if abs(lat) == 90:
+        lat = math.copysign(89.99999, lat)
+
+    B_east, B_north, B_up = ppigrf.igrf(lon, lat, 0.0, date)
+
+    B_east = float(np.asarray(B_east).item())
+    B_north = float(np.asarray(B_north).item())
+    B_up = float(np.asarray(B_up).item())
+
+    intensity = math.sqrt(B_east**2 + B_north**2 + B_up**2) / 1e5
+    inclination = math.degrees(math.atan2(-B_up, math.hypot(B_east, B_north)))
+    declination = math.degrees(math.atan2(B_east, B_north))
+
     return [declination, inclination, intensity]
 
+
 def interpolate_table(table, latitude_deg, longitude_deg):
-    '''interpolate inside a table for a given lat/lon in degrees'''
+    """interpolate inside a table for a given lat/lon in degrees"""
     # round down to nearest sampling resolution
     min_lat = int(math.floor(latitude_deg / SAMPLING_RES) * SAMPLING_RES)
     min_lon = int(math.floor(longitude_deg / SAMPLING_RES) * SAMPLING_RES)
@@ -94,11 +116,13 @@ def interpolate_table(table, latitude_deg, longitude_deg):
     return value
 
 
-'''
+"""
 calculate magnetic field intensity and orientation, interpolating in tables
 
 returns array [declination_deg, inclination_deg, intensity] or None
-'''
+"""
+
+
 def interpolate_field(latitude_deg, longitude_deg):
     # limit to table bounds
     if latitude_deg < SAMPLING_MIN_LAT:
@@ -116,15 +140,17 @@ def interpolate_field(latitude_deg, longitude_deg):
 
     return [declination_deg, inclination_deg, intensity_gauss]
 
+
 def field_to_Vector3(mag):
-    '''return mGauss field from dec, inc and intensity'''
+    """return mGauss field from dec, inc and intensity"""
     R = Matrix3()
-    mag_ef = Vector3(mag[2]*1000.0, 0.0, 0.0)
+    mag_ef = Vector3(mag[2] * 1000.0, 0.0, 0.0)
     R.from_euler(0.0, -math.radians(mag[1]), math.radians(mag[0]))
     return R * mag_ef
 
+
 def test_error(lat, lon):
-    '''check for error from lat,lon'''
+    """check for error from lat,lon"""
     global max_error, max_error_pos, max_error_field
     mag1 = get_igrf(lat, lon)
     mag2 = interpolate_field(lat, lon)
@@ -137,10 +163,11 @@ def test_error(lat, lon):
         max_error_pos = (lat, lon)
         max_error_field = ef1 - ef2
 
+
 def test_max_error(lat, lon):
-    '''check for maximum error from lat,lon over SAMPLING_RES range'''
+    """check for maximum error from lat,lon over SAMPLING_RES range"""
     steps = 3
-    delta = SAMPLING_RES/steps
+    delta = SAMPLING_RES / steps
     for i in range(steps):
         for j in range(steps):
             lat2 = lat + i * delta
@@ -151,44 +178,42 @@ def test_max_error(lat, lon):
                 continue
             test_error(lat2, lon2)
 
-for i,lat in enumerate(lats):
-    for j,lon in enumerate(lons):
+
+for i, lat in enumerate(lats):
+    for j, lon in enumerate(lons):
         mag = get_igrf(lat, lon)
         declination_table[i][j] = mag[0]
         inclination_table[i][j] = mag[1]
         intensity_table[i][j] = mag[2]
 
-with open(args.filename, 'w') as f:
-    f.write('''// this is an auto-generated file from the IGRF tables. Do not edit
+with open(args.filename, "w") as f:
+    f.write("""// this is an auto-generated file from the IGRF tables. Do not edit
 // To re-generate run generate/generate.py
 
 #include "AP_Declination.h"
 
-''')
+""")
 
-    f.write('''const float AP_Declination::SAMPLING_RES = %u;
+    f.write(
+        """const float AP_Declination::SAMPLING_RES = %u;
 const float AP_Declination::SAMPLING_MIN_LAT = %u;
 const float AP_Declination::SAMPLING_MAX_LAT = %u;
 const float AP_Declination::SAMPLING_MIN_LON = %u;
 const float AP_Declination::SAMPLING_MAX_LON = %u;
 
-''' % (SAMPLING_RES,
-           SAMPLING_MIN_LAT,
-           SAMPLING_MAX_LAT,
-           SAMPLING_MIN_LON,
-           SAMPLING_MAX_LON))
+"""
+        % (SAMPLING_RES, SAMPLING_MIN_LAT, SAMPLING_MAX_LAT, SAMPLING_MIN_LON, SAMPLING_MAX_LON)
+    )
 
-
-    write_table(f,'declination_table', declination_table)
-    write_table(f,'inclination_table', inclination_table)
-    write_table(f,'intensity_table', intensity_table)
+    write_table(f, "declination_table", declination_table)
+    write_table(f, "inclination_table", inclination_table)
+    write_table(f, "intensity_table", intensity_table)
 
 if args.check_error:
     print("Checking for maximum error")
-    for lat in range(-60,60,1):
-        for lon in range(-180,180,1):
+    for lat in range(-60, 60, 1):
+        for lon in range(-180, 180, 1):
             test_max_error(lat, lon)
-    print("Generated with max error %.2f %s at (%.2f,%.2f)" % (
-        max_error, max_error_field, max_error_pos[0], max_error_pos[1]))
+    print("Generated with max error %.2f %s at (%.2f,%.2f)" % (max_error, max_error_field, max_error_pos[0], max_error_pos[1]))
 
 print("Table generated in %s" % args.filename)
